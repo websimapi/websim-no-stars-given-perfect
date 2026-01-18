@@ -18,6 +18,10 @@ window.STAR_MEANINGS = {
 
 /* --- Data Helpers --- */
 
+window.generateId = () => {
+    return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+};
+
 // Format relative time
 window.timeAgo = (dateStr) => {
     const date = new Date(dateStr);

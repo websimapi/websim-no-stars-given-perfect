@@ -8,7 +8,7 @@ const App = () => {
     const [view, setView] = useState('feed'); // feed, profile
     const [currentUser, setCurrentUser] = useState(null);
     const [posts, setPosts] = useState([]);
-    const [stars, setStars] = useState([]); // All star transactions
+    const [ledgers, setLedgers] = useState([]); // "Single Row" source of truth
     const [replies, setReplies] = useState([]); // All replies
     
     // UI State
@@ -28,14 +28,36 @@ const App = () => {
 
         const unsubPosts = room.collection('post').subscribe(setPosts);
         const unsubReplies = room.collection('reply').subscribe(setReplies);
-        const unsubStars = room.collection('star_transaction').subscribe(setStars);
+        const unsubLedgers = room.collection('user_ledger').subscribe(setLedgers);
 
         return () => {
             unsubPosts();
             unsubReplies();
-            unsubStars();
+            unsubLedgers();
         };
     }, []);
+
+    // Derived Stars from Ledgers (The "No Stars Given" Validation Logic)
+    // We scan all user rows (ledgers) to find stars given to the current context.
+    // This enforces "Clients reject stars that show in row of user receiving but dont show in row of the user who gave"
+    // by ONLY reading from the giver's authenticated row.
+    const stars = useMemo(() => {
+        const all = [];
+        ledgers.forEach(row => {
+            if (row.ledger && Array.isArray(row.ledger)) {
+                row.ledger.forEach(txn => {
+                    all.push({
+                        ...txn,
+                        // Implicit Validation: The record comes from the user's authenticated row
+                        from_user_id: row.user_id,
+                        from_username: row.username,
+                        created_at: txn.timestamp
+                    });
+                });
+            }
+        });
+        return all;
+    }, [ledgers]);
 
     // Derived Data
     const userMap = useMemo(() => {
@@ -51,18 +73,37 @@ const App = () => {
         if (!currentUser) return;
         
         try {
-            // Optimistic Update
-            setDailyBudget(prev => prev - amount);
+            setDailyBudget(prev => prev - amount); // Optimistic UI
 
-            await room.collection('star_transaction').create({
-                from_user_id: currentUser.id,
+            // Architecture: User Author Only 1 Row
+            // We append to our own ledger.
+            const myLedger = ledgers.find(l => l.user_id === currentUser.id);
+            
+            const newTxn = {
+                id: window.generateId(),
                 to_user_id: toUserId,
                 post_id: activePost.id,
                 reply_id: replyId,
                 amount: amount,
-                domain: activePost.domain, 
-                message: window.STAR_MEANINGS[amount]
-            });
+                domain: activePost.domain,
+                message: window.STAR_MEANINGS[amount],
+                timestamp: new Date().toISOString()
+            };
+
+            if (myLedger) {
+                // Update existing row
+                const updatedList = [...(myLedger.ledger || []), newTxn];
+                await room.collection('user_ledger').update(myLedger.id, {
+                    ledger: updatedList
+                });
+            } else {
+                // Create my one row
+                await room.collection('user_ledger').create({
+                    user_id: currentUser.id,
+                    username: currentUser.username,
+                    ledger: [newTxn]
+                });
+            }
 
         } catch (e) {
             console.error("Star error", e);
