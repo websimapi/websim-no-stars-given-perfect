@@ -291,7 +291,7 @@ const App = () => {
     // Sync Data
     useEffect(() => {
         const fetchUser = async () => {
-            const u = await room.getCurrentUser();
+            const u = await window.websim.getCurrentUser();
             setCurrentUser(u);
         };
         fetchUser();
