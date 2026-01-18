@@ -7,18 +7,16 @@ const room = new WebsimSocket();
 const App = () => {
     const [view, setView] = useState('feed'); // feed, profile
     const [currentUser, setCurrentUser] = useState(null);
-    const [posts, setPosts] = useState([]);
-    const [ledgers, setLedgers] = useState([]); // "Single Row" source of truth
-    const [replies, setReplies] = useState([]); // All replies
+    
+    // Core Data: 1 Row Per User Architecture
+    const [userRows, setUserRows] = useState([]);
     
     // UI State
     const [activePost, setActivePost] = useState(null);
     const [isPosting, setIsPosting] = useState(false);
-
-    // Mock Budget Logic (Local state for MVP)
     const [dailyBudget, setDailyBudget] = useState(10); 
 
-    // Sync Data
+    // 1. Sync All User Rows
     useEffect(() => {
         const fetchUser = async () => {
             const u = await window.websim.getCurrentUser();
@@ -26,111 +24,128 @@ const App = () => {
         };
         fetchUser();
 
-        const unsubPosts = room.collection('post').subscribe(setPosts);
-        const unsubReplies = room.collection('reply').subscribe(setReplies);
-        const unsubLedgers = room.collection('user_ledger').subscribe(setLedgers);
-
-        return () => {
-            unsubPosts();
-            unsubReplies();
-            unsubLedgers();
-        };
+        // Subscribe to the single collection 'user_state'
+        const unsub = room.collection('user_state').subscribe(setUserRows);
+        return unsub;
     }, []);
 
-    // Derived Stars from Ledgers (The "No Stars Given" Validation Logic)
-    // We scan all user rows (ledgers) to find stars given to the current context.
-    // This enforces "Clients reject stars that show in row of user receiving but dont show in row of the user who gave"
-    // by ONLY reading from the giver's authenticated row.
-    const stars = useMemo(() => {
-        const all = [];
-        ledgers.forEach(row => {
-            if (row.ledger && Array.isArray(row.ledger)) {
-                row.ledger.forEach(txn => {
-                    all.push({
-                        ...txn,
-                        // Implicit Validation: The record comes from the user's authenticated row
-                        from_user_id: row.user_id,
-                        from_username: row.username,
-                        created_at: txn.timestamp
-                    });
-                });
+    // 2. Aggregate Data (Flatten from all user rows)
+    const { posts, replies, stars } = useMemo(() => {
+        let allPosts = [];
+        let allReplies = [];
+        let allStars = [];
+
+        userRows.forEach(row => {
+            // Posts owned by row author
+            if (Array.isArray(row.posts)) {
+                allPosts.push(...row.posts.map(p => ({
+                    ...p, 
+                    author_id: row.user_id, 
+                    username: row.username
+                })));
+            }
+            // Replies owned by row author
+            if (Array.isArray(row.replies)) {
+                allReplies.push(...row.replies.map(r => ({
+                    ...r, 
+                    author_id: row.user_id, 
+                    username: row.username
+                })));
+            }
+            // Stars given by row author
+            if (Array.isArray(row.stars_given)) {
+                allStars.push(...row.stars_given.map(s => ({
+                    ...s, 
+                    from_user_id: row.user_id, 
+                    from_username: row.username
+                })));
             }
         });
-        return all;
-    }, [ledgers]);
 
-    // Derived Data
+        return { 
+            posts: allPosts.sort((a,b) => new Date(b.created_at) - new Date(a.created_at)), 
+            replies: allReplies, 
+            stars: allStars 
+        };
+    }, [userRows]);
+
+    // 3. Derived Helpers
     const userMap = useMemo(() => {
         const map = {};
-        [...posts, ...replies].forEach(item => {
-            if (item.username) map[item.author_id] = { username: item.username, id: item.author_id };
+        userRows.forEach(r => {
+            map[r.user_id] = { username: r.username, id: r.user_id };
         });
         if (currentUser) map[currentUser.id] = currentUser;
         return map;
-    }, [posts, replies, currentUser]);
+    }, [userRows, currentUser]);
 
-    const handleGiveStars = async (amount, replyId, toUserId) => {
+    // 4. Action Handlers (Append to My Row)
+    const updateMyRow = async (field, newItem) => {
         if (!currentUser) return;
         
+        // Optimistic / Local Gen
+        const itemWithMeta = {
+            ...newItem,
+            id: newItem.id || window.generateId(),
+            created_at: newItem.created_at || new Date().toISOString()
+        };
+
+        const myRow = userRows.find(r => r.user_id === currentUser.id);
+
         try {
-            setDailyBudget(prev => prev - amount); // Optimistic UI
-
-            // Architecture: User Author Only 1 Row
-            // We append to our own ledger.
-            const myLedger = ledgers.find(l => l.user_id === currentUser.id);
-            
-            const newTxn = {
-                id: window.generateId(),
-                to_user_id: toUserId,
-                post_id: activePost.id,
-                reply_id: replyId,
-                amount: amount,
-                domain: activePost.domain,
-                message: window.STAR_MEANINGS[amount],
-                timestamp: new Date().toISOString()
-            };
-
-            if (myLedger) {
-                // Update existing row
-                const updatedList = [...(myLedger.ledger || []), newTxn];
-                await room.collection('user_ledger').update(myLedger.id, {
-                    ledger: updatedList
+            if (myRow) {
+                const list = myRow[field] || [];
+                // Append
+                await room.collection('user_state').update(myRow.id, {
+                    [field]: [...list, itemWithMeta]
                 });
             } else {
-                // Create my one row
-                await room.collection('user_ledger').create({
+                // Initialize My Row
+                await room.collection('user_state').create({
                     user_id: currentUser.id,
                     username: currentUser.username,
-                    ledger: [newTxn]
+                    posts: [],
+                    replies: [],
+                    stars_given: [],
+                    [field]: [itemWithMeta]
                 });
             }
-
         } catch (e) {
-            console.error("Star error", e);
-            setDailyBudget(prev => prev + amount); // Rollback
+            console.error("Failed to update row", e);
+            alert("Could not save to your ledger. Try again.");
         }
     };
 
-    const handleReply = async (text) => {
+    const handleCreatePost = (postData) => updateMyRow('posts', postData);
+    
+    const handleReply = (text) => {
         if (!activePost) return;
-        try {
-            await room.collection('reply').create({
-                post_id: activePost.id,
-                content: text,
-                parent_id: activePost.id
-            });
-        } catch (e) {
-            console.error(e);
-        }
+        updateMyRow('replies', { 
+            post_id: activePost.id, 
+            content: text,
+            parent_id: activePost.id 
+        });
     };
 
-    // Filter Logic
-    const sortedPosts = [...posts].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    const activeReplies = activePost ? replies.filter(r => r.post_id === activePost.id) : [];
+    const handleGiveStars = async (amount, replyId, toUserId) => {
+        if (dailyBudget < amount) return;
+        
+        setDailyBudget(p => p - amount); // Optimistic UI
+        
+        await updateMyRow('stars_given', {
+            to_user_id: toUserId,
+            post_id: activePost.id,
+            reply_id: replyId,
+            amount,
+            domain: activePost.domain,
+            message: window.STAR_MEANINGS[amount]
+        });
+    };
 
-    if (!currentUser) return <div className="flex items-center justify-center h-screen text-slate-400">Loading...</div>;
+    if (!currentUser) return <div className="flex items-center justify-center h-screen text-slate-400">Loading User State...</div>;
 
     const myStats = window.calculateUserStats(stars, currentUser.id);
+    const activeReplies = activePost ? replies.filter(r => r.post_id === activePost.id) : [];
 
     return (
         <div className="max-w-md mx-auto h-screen flex flex-col bg-slate-50 relative overflow-hidden shadow-2xl">
@@ -158,7 +173,7 @@ const App = () => {
             <div className="flex-1 overflow-y-auto no-scrollbar relative p-4 pb-24">
                 {view === 'feed' && (
                     <div className="space-y-4 animate-in fade-in duration-300">
-                         {/* Intro Concept Card (Dismissible in real app) */}
+                         {/* Intro Concept Card */}
                         <div className="bg-slate-900 text-white p-4 rounded-xl shadow-lg relative overflow-hidden mb-6">
                             <i className="ri-star-line absolute -right-4 -bottom-4 text-9xl opacity-10"></i>
                             <h2 className="font-bold text-lg mb-1">Feedback without fear.</h2>
@@ -167,7 +182,7 @@ const App = () => {
                             </p>
                         </div>
 
-                        {sortedPosts.map(post => (
+                        {posts.map(post => (
                             <window.PostItem 
                                 key={post.id} 
                                 post={post} 
@@ -177,10 +192,11 @@ const App = () => {
                             />
                         ))}
                         
-                        {sortedPosts.length === 0 && (
+                        {posts.length === 0 && (
                             <div className="text-center py-12 text-slate-400">
                                 <i className="ri-windy-line text-4xl mb-2 block"></i>
                                 <p>No requests yet.</p>
+                                <p className="text-xs mt-2">Be the first to ask for help.</p>
                             </div>
                         )}
                     </div>
@@ -260,7 +276,7 @@ const App = () => {
                     onGiveStars={handleGiveStars}
                 />
             )}
-            {isPosting && <window.CreatePostModal onClose={() => setIsPosting(false)} room={room} />}
+            {isPosting && <window.CreatePostModal onClose={() => setIsPosting(false)} onCreate={handleCreatePost} />}
         </div>
     );
 };

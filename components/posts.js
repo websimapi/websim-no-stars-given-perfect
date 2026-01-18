@@ -34,7 +34,7 @@ window.PostItem = ({ post, onOpen, userMap, repliesCount }) => {
     );
 };
 
-window.CreatePostModal = ({ onClose, room }) => {
+window.CreatePostModal = ({ onClose, onCreate }) => {
     const [title, setTitle] = useState("");
     const [content, setContent] = useState("");
     const [domain, setDomain] = useState(window.DOMAINS[0].id);
@@ -44,7 +44,7 @@ window.CreatePostModal = ({ onClose, room }) => {
         if (!title.trim() || !content.trim()) return;
         setIsSubmitting(true);
         try {
-            await room.collection('post').create({
+            await onCreate({
                 title,
                 content,
                 domain,
